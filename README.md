@@ -101,6 +101,7 @@ All settings can be customised via the `.env` file (or environment variables):
    - Detects whether the plugin uses `pyproject.toml` or `requirements.txt`:
      - **pyproject.toml** — injects `environments` (current OS + Python) and removes `[dependency-groups]` from `pyproject.toml`, runs `uv lock` to pin exact versions, exports the pinned list via `uv export`, downloads wheels via `uv run python -m pip download`, patches the `[tool.uv]` section with `no-index = true` and `find-links = ["./wheels/"]`, then deletes `uv.lock` (required because `--no-index` and `--frozen` are conflicting options in uv).
      - **requirements.txt** — downloads wheels via `uv run python -m pip download`, then prepends `--no-index --find-links=./wheels/`.
+     - Only wheels are downloaded (`pip download --only-binary=:all:`). If a dependency is published only as a source distribution (for example `docopt`), the missing wheels are built locally with `pip wheel`, so the offline target never needs `setuptools` or a compiler.
    - Downloads the `dify-plugin` CLI binary from GitHub (cached across runs).
    - Repacks the plugin with `dify-plugin plugin package`.
 

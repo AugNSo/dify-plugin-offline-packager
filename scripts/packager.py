@@ -57,16 +57,17 @@ def download_file(url: str, dest: str) -> None:
         shutil.copyfileobj(resp, f)
 
 
-def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    """Run a subprocess, printing the command and raising on failure."""
+def run(cmd: list[str], check: bool = True, **kwargs) -> subprocess.CompletedProcess:
+    """Run a subprocess, printing the command. Exits on failure unless check=False."""
     print(f"  ▸ {' '.join(cmd)}", flush=True)
-    try:
-        return subprocess.run(cmd, check=True, **kwargs)
-    except subprocess.CalledProcessError as e:
-        if e.stderr:
-            print(e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace"),
+    proc = subprocess.run(cmd, **kwargs)
+    if proc.returncode != 0:
+        if proc.stderr:
+            print(proc.stderr if isinstance(proc.stderr, str) else proc.stderr.decode(errors="replace"),
                   file=sys.stderr, flush=True)
-        sys.exit(f"\n❌ Command failed (exit {e.returncode}): {' '.join(e.cmd)}")
+        if check:
+            sys.exit(f"\n❌ Command failed (exit {proc.returncode}): {' '.join(cmd)}")
+    return proc
 
 
 def ensure_dify_plugin_cli() -> Path:
@@ -167,22 +168,89 @@ def resolve_local(path_str: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _pip_index_args() -> list[str]:
+    """Return the --index-url arguments shared by all pip invocations."""
+    return ["--index-url", PIP_INDEX_URL] if PIP_INDEX_URL else []
+
+
 def _pip_download_cmd(req_file: Path, wheels_dir: Path) -> list[str]:
-    """Build the base `uv run python -m pip download` command."""
-    cmd = [
+    """
+    Build the `uv run python -m pip download` command.
+
+    ``--only-binary=:all:`` makes pip fail (instead of silently saving an
+    sdist) when a dependency has no prebuilt wheel on the index.  Source
+    distributions are useless inside an offline package: the target Dify
+    host has no index and no build backend available (``--no-index`` only
+    serves ``./wheels/``), so building the sdist fails with errors such as
+    "setuptools was not found in the provided package locations".
+    """
+    return [
         "uv", "run", "python", "-m", "pip", "download",
         "-r", str(req_file),
         "-d", str(wheels_dir),
-    ]
-    if PIP_INDEX_URL:
-        cmd += ["--index-url", PIP_INDEX_URL]
-    return cmd
+        "--only-binary=:all:",
+        "--prefer-binary",
+    ] + _pip_index_args()
+
+
+def _pip_wheel_cmd(req_file: Path, wheels_dir: Path) -> list[str]:
+    """Build the `uv run python -m pip wheel` command used as a fallback.
+
+    Unlike ``pip download``, ``pip wheel`` turns sdist-only dependencies into
+    real wheels (using build isolation to fetch any build backend such as
+    setuptools), and reuses wheels that are already present in ``wheels_dir``.
+    """
+    return [
+        "uv", "run", "python", "-m", "pip", "wheel",
+        "-r", str(req_file),
+        "--wheel-dir", str(wheels_dir),
+        "--prefer-binary",
+    ] + _pip_index_args()
+
+
+def _remove_non_wheel_artifacts(wheels_dir: Path) -> None:
+    """Delete anything that is not a ``.whl`` from the wheels directory."""
+    stale = sorted(
+        p for p in wheels_dir.iterdir()
+        if p.is_file() and p.suffix != ".whl"
+    )
+    for p in stale:
+        p.unlink()
+    if stale:
+        print(f"   🧹 Removed non-wheel artifacts: {', '.join(p.name for p in stale)}")
 
 
 def _download_wheels_pip(req_file: Path, wheels_dir: Path) -> None:
-    """Download wheels using pip based on requirements.txt."""
-    print("⬇  Downloading Python dependencies …")
-    run(_pip_download_cmd(req_file, wheels_dir))
+    """
+    Download wheels using pip, building sdist-only dependencies when needed.
+
+    The first pass only accepts prebuilt wheels.  If any dependency is not
+    published as a wheel (e.g. ``docopt``, which only ships a ``.tar.gz``),
+    the second pass builds the missing wheels from source **on this machine**,
+    where an internet connection and build backends are available.  The
+    resulting package then only contains wheels, so it installs offline.
+    """
+    print("⬇  Downloading prebuilt Python wheels …")
+    proc = run(_pip_download_cmd(req_file, wheels_dir), check=False)
+    if proc.returncode != 0:
+        print("   ⚠  Prebuilt wheels are unavailable for one or more dependencies.")
+        print("   🔨 Building the missing wheels locally from source …")
+        proc = run(_pip_wheel_cmd(req_file, wheels_dir), check=False)
+        if proc.returncode != 0:
+            sys.exit(
+                "❌ Failed to build wheels for source-only dependencies.\n"
+                "   Build them on a machine matching the target platform (C compiler, Python\n"
+                "   headers and a Rust toolchain may be required), or pin versions of those\n"
+                "   dependencies that publish prebuilt wheels."
+            )
+
+    # Any sdist left here would only be discovered (and fail) at install time.
+    _remove_non_wheel_artifacts(wheels_dir)
+
+    count = len(list(wheels_dir.glob("*.whl")))
+    if count == 0:
+        sys.exit("❌ No wheels were collected – cannot build an offline package.")
+    print(f"   ✔  {count} wheels ready.")
 
 
 def _download_wheels_uv(extract_dir: Path, wheels_dir: Path) -> None:
@@ -241,8 +309,7 @@ def _download_wheels_uv(extract_dir: Path, wheels_dir: Path) -> None:
     exported_req = extract_dir / "_exported_requirements.txt"
     exported_req.write_text(export_result.stdout)
     try:
-        print("⬇  Downloading Python dependencies …")  # step 4
-        run(_pip_download_cmd(exported_req, wheels_dir))
+        _download_wheels_pip(exported_req, wheels_dir)  # step 4
     finally:
         exported_req.unlink(missing_ok=True)
 
@@ -387,7 +454,8 @@ def package_offline(pkg_path: Path, cli: Path, work: Path) -> Path:
     Package a .difypkg with bundled wheels for offline use.
 
     1. Unzip the package
-    2. Lock dependencies and download all wheels (via uv lock + uv run python -m pip download)
+    2. Lock dependencies and download all wheels (via uv lock + uv run python -m pip download,
+       building wheels from source for sdist-only packages)
     3. Patch pyproject.toml or requirements.txt for offline use
     4. Re-pack using the dify-plugin CLI
     """
